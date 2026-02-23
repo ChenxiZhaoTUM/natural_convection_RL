@@ -1,0 +1,14 @@
+same training process for single-phase and two-phase problems
+
+single agent:
+env: drl/drl_gym_environments/gym_env_nc/envs/NCEnvironment.py
+training: drl/drl_tianshou_training/sac_single.py 
+
+multi-agent:
+env: drl/drl_gym_environments/gym_env_nc/marl/wrapper.py + NCPseudoEnv.py
+training: drl/drl_tianshou_training/sac_multi.py or ppo_multi.py
+
+CTDE:
+env: drl/drl_gym_environments/gym_env_nc/CTDE/NCJointEnv.py
+RL model: drl/drl_gym_environments/gym_env_nc/CTDE/masac_CTDE.py
+training: drl/drl_gym_environments/gym_env_nc/CTDE/train_masac_CTDE.py
