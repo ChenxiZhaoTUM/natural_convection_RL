@@ -52,8 +52,6 @@ def make_env(
     avg_len: int,
     max_steps: int,
     beta: float,
-    nu_target: float,
-    reward_scale: float,
     baseline_temp: float,
 ):
     # ---- SPHinXsys binding ----
@@ -88,8 +86,6 @@ def make_env(
         avg_len=avg_len,
         max_steps_per_episode=max_steps,
         beta=beta,
-        nu_target=nu_target,
-        reward_scale=reward_scale,
         baseline_temp=baseline_temp,
     )
 
@@ -162,13 +158,11 @@ def get_args():
     p.add_argument("--groups", type=int, default=1)
 
     p.add_argument("--warmup-time", type=float, default=400.0)
-    p.add_argument("--delta-time", type=float, default=2.0)
+    p.add_argument("--delta-time", type=float, default=1.5)
     p.add_argument("--avg-len", type=int, default=4)
     p.add_argument("--max-steps", type=int, default=200)
 
     p.add_argument("--beta", type=float, default=0.0015)
-    p.add_argument("--nu-target", type=float, default=22.5)
-    p.add_argument("--reward-scale", type=float, default=1.0)
     p.add_argument("--baseline-temp", type=float, default=2.0)
 
     p.add_argument("--run-name", type=str, default="training_results_pseudo")
@@ -268,8 +262,6 @@ def main():
                     avg_len=args.avg_len,
                     max_steps=args.max_steps,
                     beta=args.beta,
-                    nu_target=args.nu_target,
-                    reward_scale=args.reward_scale,
                     baseline_temp=args.baseline_temp,
                 )
             )
@@ -296,8 +288,6 @@ def main():
                 avg_len=args.avg_len,
                 max_steps=args.max_steps,
                 beta=args.beta,
-                nu_target=args.nu_target,
-                reward_scale=args.reward_scale,
                 baseline_temp=args.baseline_temp,
             )
         )
