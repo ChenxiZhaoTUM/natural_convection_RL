@@ -110,7 +110,7 @@ class MASACConfig:
 class MASACCTDE:
     """
     Cooperative CTDE MASAC:
-    - 10 independent actors: pi_i(a_i|o_i)
+    - 1 shared actor: pi(a_i|o_i)
     - 1 centralized twin critic: Q(o_1..o_n, a_1..a_n)
     - shared reward
     """
@@ -119,10 +119,7 @@ class MASACCTDE:
         self.cfg = cfg
         self.device = torch.device(device)
 
-        self.actors = nn.ModuleList([
-            TanhGaussianActor(cfg.obs_dim, hidden=hidden).to(self.device)
-            for _ in range(cfg.n_agents)
-        ])
+        self.actor = TanhGaussianActor(cfg.obs_dim, hidden=hidden).to(self.device)
 
         joint_obs_dim = cfg.n_agents * cfg.obs_dim
         joint_act_dim = cfg.n_agents * cfg.act_dim
@@ -134,8 +131,7 @@ class MASACCTDE:
         self.q1_t.load_state_dict(self.q1.state_dict())
         self.q2_t.load_state_dict(self.q2.state_dict())
 
-        # optimizers (independent actors => separate optimizers is cleanest)
-        self.actor_opt = [torch.optim.Adam(a.parameters(), lr=cfg.actor_lr) for a in self.actors]
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
         self.q1_opt = torch.optim.Adam(self.q1.parameters(), lr=cfg.critic_lr)
         self.q2_opt = torch.optim.Adam(self.q2.parameters(), lr=cfg.critic_lr)
 
@@ -159,6 +155,27 @@ class MASACCTDE:
             for p_t, p in zip(net_t.parameters(), net.parameters()):
                 p_t.data.mul_(1.0 - tau).add_(tau * p.data)
 
+    def _actor_forward_joint(self, obs_joint: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        obs_joint: (B, n_agents, obs_dim)
+        returns:
+          action_joint: (B, n_agents * act_dim)
+          logp_sum:     (B, 1)
+        """
+        B, n, d = obs_joint.shape
+        if n != self.cfg.n_agents or d != self.cfg.obs_dim:
+            raise ValueError(
+                f"obs_joint shape mismatch: got {(B, n, d)}, "
+                f"expected (*, {self.cfg.n_agents}, {self.cfg.obs_dim})"
+            )
+
+        flat_obs = obs_joint.reshape(B * n, d)
+        flat_a, flat_logp, _ = self.actor(flat_obs)
+        a_joint = flat_a.reshape(B, n * self.cfg.act_dim)
+        logp = flat_logp.reshape(B, n, 1)
+        logp_sum = logp.sum(dim=1)
+        return a_joint, logp_sum
+
     @torch.no_grad()
     def select_action(self, obs_local: np.ndarray, deterministic: bool = False) -> np.ndarray:
         """
@@ -171,11 +188,9 @@ class MASACCTDE:
         B, n, d = x.shape
         assert n == self.cfg.n_agents and d == self.cfg.obs_dim
 
-        actions = []
-        for i in range(n):
-            a_i = self.actors[i].act(x[:, i, :], deterministic=deterministic)  # (B,1)
-            actions.append(a_i)
-        a = np.concatenate(actions, axis=1).astype(np.float32)  # (B,n)
+        flat_obs = x.reshape(B * n, d)
+        flat_a = self.actor.act(flat_obs, deterministic=deterministic)
+        a = flat_a.reshape(B, n * self.cfg.act_dim).astype(np.float32)
         if obs_local.ndim == 2:
             return a[0]
         return a
@@ -204,15 +219,7 @@ class MASACCTDE:
 
         # -------- critic target (soft Bellman) --------
         with torch.no_grad():
-            next_actions = []
-            next_logps = []
-            for i in range(n):
-                a_i, logp_i, _ = self.actors[i](nxt[:, i, :])  # (B,1)
-                next_actions.append(a_i)
-                next_logps.append(logp_i)
-            a_nxt = torch.cat(next_actions, dim=1)  # (B,n)
-            logp_sum_nxt = torch.sum(torch.cat(next_logps, dim=1), dim=1, keepdim=True)  # (B,1)
-
+            a_nxt, logp_sum_nxt = self._actor_forward_joint(nxt)
             q1_t = self.q1_t(joint_nxt, a_nxt)
             q2_t = self.q2_t(joint_nxt, a_nxt)
             q_t = torch.min(q1_t, q2_t) - alpha_detached * logp_sum_nxt
@@ -239,24 +246,13 @@ class MASACCTDE:
         for p in self.q2.parameters():
             p.requires_grad_(False)
 
-        actions = []
-        logps = []
-        for i in range(n):
-            a_i, logp_i, _ = self.actors[i](obs[:, i, :])  # (B,1)
-            actions.append(a_i)
-            logps.append(logp_i)
-
-        a_joint = torch.cat(actions, dim=1)  # (B,n)
-        logp_sum = torch.sum(torch.cat(logps, dim=1), dim=1, keepdim=True)  # (B,1)
-
+        a_joint, logp_sum = self._actor_forward_joint(obs)
         q_pi = torch.min(self.q1(joint_obs, a_joint), self.q2(joint_obs, a_joint))
         actor_loss = (alpha_detached * logp_sum - q_pi).mean()
 
-        for opt in self.actor_opt:
-            opt.zero_grad(set_to_none=True)
+        self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
-        for opt in self.actor_opt:
-            opt.step()
+        self.actor_opt.step()
 
         # Unfreeze critics
         for p in self.q1.parameters():

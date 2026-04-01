@@ -156,8 +156,7 @@ def make_env(
 @torch.no_grad()
 def evaluate(env: NCJointEnv, agent: MASACCTDE, episodes: int = 1) -> float:
     # set eval mode (规范做法；即使无 dropout/bn 也建议)
-    for a in agent.actors:
-        a.eval()
+    agent.actor.eval()
     agent.q1.eval()
     agent.q2.eval()
 
@@ -174,8 +173,7 @@ def evaluate(env: NCJointEnv, agent: MASACCTDE, episodes: int = 1) -> float:
         rets.append(ep_ret)
 
     # back to train mode
-    for a in agent.actors:
-        a.train()
+    agent.actor.train()
     agent.q1.train()
     agent.q2.train()
 
@@ -339,9 +337,10 @@ def main():
         os.replace(tmp, path)
 
     def save_best_models(best_value: float, epoch: int):
-        # policy (10 actors)
+        # shared policy
         actor_payload = {
-            "actors": [a.state_dict() for a in agent.actors],
+            "actor": agent.actor.state_dict(),
+            "shared_actor": True,
             "n_agents": args.n_seg,
             "obs_dim": obs_dim,
             "hidden_sizes": list(args.hidden_sizes),
