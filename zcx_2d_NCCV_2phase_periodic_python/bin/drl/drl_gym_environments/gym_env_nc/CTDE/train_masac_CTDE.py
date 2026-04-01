@@ -126,8 +126,6 @@ def make_env(
         avg_len: int,
         max_steps: int,
         beta: float,
-        nu_target: float,
-        reward_scale: float,
         baseline_temp: float,
 ) -> NCJointEnv:
     if sph_lib_path and sph_lib_path not in sys.path:
@@ -148,8 +146,6 @@ def make_env(
         delta_time=float(delta_time),
         max_steps_per_episode=int(max_steps),
         beta=float(beta),
-        nu_target=float(nu_target),
-        reward_scale=float(reward_scale),
         baseline_T=float(baseline_temp),
     )
 
@@ -204,8 +200,8 @@ def get_args():
     p.add_argument("--max-steps", type=int, default=200)
 
     p.add_argument("--beta", type=float, default=0.0015)
-    p.add_argument("--nu-target", type=float, default=22.5)
-    p.add_argument("--reward-scale", type=float, default=1.0)
+    p.add_argument("--nu-target", type=float, default=22.5, help=argparse.SUPPRESS)
+    p.add_argument("--reward-scale", type=float, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--baseline-temp", type=float, default=2.0)
 
     p.add_argument("--seed", type=int, default=0)
@@ -217,12 +213,12 @@ def get_args():
     p.add_argument("--alpha-lr", type=float, default=5e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
-    p.add_argument("--auto-alpha", action="store_true", default=True)
+    p.add_argument("--auto-alpha", action="store_true", default=False)
     p.add_argument("--init-alpha", type=float, default=0.25)
 
     p.add_argument("--buffer-size", type=int, default=100_000)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--start-steps", type=int, default=2000)  # ?
+    p.add_argument("--start-steps", type=int, default=3000)
     p.add_argument("--updates-per-step", type=int, default=1)
 
     p.add_argument("--epochs", type=int, default=50)
@@ -248,6 +244,7 @@ def main():
     args = get_args()
     set_seed(args.seed)
     torch.set_num_threads(1)
+    args.auto_alpha = True
 
     # ---- decide run_root ----
     if args.run_root is None:
@@ -276,8 +273,6 @@ def main():
             avg_len=args.avg_len,
             max_steps=args.max_steps,
             beta=args.beta,
-            nu_target=args.nu_target,
-            reward_scale=args.reward_scale,
             baseline_temp=args.baseline_temp,
         )
         train_envs.append(env)
@@ -295,16 +290,14 @@ def main():
         avg_len=args.avg_len,
         max_steps=args.max_steps,
         beta=args.beta,
-        nu_target=args.nu_target,
-        reward_scale=args.reward_scale,
         baseline_temp=args.baseline_temp,
     )
 
-    # ---- infer local obs_dim ----
-    obs0, _ = train_envs[0].reset()
-    if obs0.shape[0] != args.n_seg:
-        raise RuntimeError(f"Env obs should be (n_seg, local_dim). Got {obs0.shape}")
-    obs_dim = int(obs0.shape[1])
+    # ---- infer per-agent obs_dim from space (avoid consuming an episode reset) ----
+    obs_shape = train_envs[0].observation_space.shape
+    if len(obs_shape) != 2 or obs_shape[0] != args.n_seg:
+        raise RuntimeError(f"Env obs space should be (n_seg, obs_dim). Got {obs_shape}")
+    obs_dim = int(obs_shape[1])
 
     # ---- MASAC CTDE ----
     cfg = MASACConfig(

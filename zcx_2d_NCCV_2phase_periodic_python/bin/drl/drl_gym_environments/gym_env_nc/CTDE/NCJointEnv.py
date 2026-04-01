@@ -31,7 +31,7 @@ def actions_to_segment_temps(
         Tmin: float = 0.0,
         Tmax: float = 4.0,
 ) -> np.ndarray:
-    """Map joint actions in [-1,1] to safe segment temperatures with demean+normalize."""
+    """Map joint actions in [-1, 1] to physically safe segment temperatures."""
     a = np.asarray(raw_actions, dtype=np.float32).reshape(-1)
     a = np.clip(a, -1.0, 1.0)
     centered = a - float(np.mean(a))
@@ -42,19 +42,10 @@ def actions_to_segment_temps(
 
 class NCJointEnv(gym.Env):
     """
-    Joint env (1 CFD group == 1 env):
+    CTDE joint env aligned with marl reward/training semantics:
     - action: joint action (n_seg,)
-    - obs: local obs for each agent, shape (n_seg, local_dim) (strict local patch)
-
-    Training reward: ONLY global heat flux (get_global_heat_flux)
-    Logging: per-seg diagnostic reward from local_phi_flux(i)
-
-    Solver interface:
-    - solver_factory(group_id, episode, restart_step) -> sim
-    - sim.set_segment_temperatures(list_len_n_seg)
-    - sim.run_case(end_time)
-    - sim.get_local_velocity(idx, dim), sim.get_local_temperature(idx)
-    - sim.get_global_heat_flux(), sim.get_local_phi_flux(i)
+    - obs: per-agent local patch observation, shape (n_seg, n_rows*(n_cols/n_seg)*3)
+    - reward: shared mean reward computed from marl's flux/KE shaping
     """
 
     metadata = {"render_modes": []}
@@ -71,135 +62,130 @@ class NCJointEnv(gym.Env):
             warmup_time: float = 400.0,
             delta_time: float = 2.0,
             max_steps_per_episode: int = 200,
-            deterministic_eval: bool = False,
-            max_steps_eval_mul: int = 4,
-            # reward params (still used for shaping / logging)
-            beta: float = 0.0015,  # (kept for compatibility; not used in global reward now)
-            nu_target: float = 22.5,
-            reward_scale: float = 1.0,
-            # action->temperature
-            baseline_T: float = 2.0
+            beta: float = 0.0015,
+            baseline_T: float = 2.0,
+            flux_base: float = 0.19,
+            flux_scale: float = 0.018,
+            ke_base: float = 0.04,
+            ke_scale: float = 0.004,
+            w_flux: float = 1.0,
+            w_ke: float = 0.0,
     ):
         super().__init__()
         self.solver_factory = solver_factory
         self.group_id = int(group_id)
 
-        # ---- persist roots (FIX: training_root must exist as member) ----
         self.training_root = os.path.abspath(training_root)
         self.case_root = _mkdir(os.path.join(self.training_root, f"CFD_n{self.group_id}"))
         for name in ("input", "output", "reload", "restart"):
             _mkdir(os.path.join(self.case_root, name))
         self.restart_dir = os.path.join(self.case_root, "restart")
 
-        # ---- env geometry ----
         self.n_seg = int(n_seg)
         self.n_rows = int(n_rows)
         self.n_cols = int(n_cols)
         self.avg_len = int(avg_len)
         self._probe_dim = 3
-
         if self.n_cols % self.n_seg != 0:
             raise ValueError(f"Need n_cols % n_seg == 0. n_cols={self.n_cols}, n_seg={self.n_seg}")
+
         self.cols_per_seg = self.n_cols // self.n_seg
         self.local_dim = self.n_rows * self.cols_per_seg * self._probe_dim
 
-        # ---- time & episode ----
         self.warmup_time = float(warmup_time)
         self.delta_time = float(delta_time)
         self.max_steps = int(max_steps_per_episode)
 
-        self.deterministic = bool(deterministic_eval)
-        self.max_steps_eval = int(max_steps_eval_mul) * self.max_steps
-
-        # ---- reward params ----
-        self.beta = float(beta)  # kept (not used for global reward)
-        self.nu_target = float(nu_target)
-        self.reward_scale = float(reward_scale)
-
-        # ---- action->temperature params ----
+        self.beta = float(beta)
         self.baseline_T = float(baseline_T)
+        self.flux_base = float(flux_base)
+        self.flux_scale = float(flux_scale)
+        self.ke_base = float(ke_base)
+        self.ke_scale = float(ke_scale)
+        self.w_flux = float(w_flux)
+        self.w_ke = float(w_ke)
 
-        # ---- spaces ----
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.n_seg,), dtype=np.float32)
         self.observation_space = spaces.Box(
             low=-1e6, high=1e6, shape=(self.n_seg, self.local_dim), dtype=np.float32
         )
 
-        # ---- runtime state ----
         self.episode = 1
         self.step_count = 0
-        self.sim_time = 0.0
+        self.sim_time = float(self.warmup_time)
         self.restart_step = -1
-        self.nc_base = None
         self.nc = None
-        self._probe_hist = deque(maxlen=self.avg_len)
 
-        # ---- logging ----
+        self._probe_hist = deque(maxlen=self.avg_len)
+        self._fluxes_hist = deque(maxlen=self.avg_len)
+        self._ke_hist = deque(maxlen=self.avg_len)
+
         self.log_root = os.path.join(self.training_root, f"logs_env_{self.group_id}")
         self._step_curve_inited = False
         self._episode_return = 0.0
 
-    # ------------------ probe grid & obs ------------------
     def _probe_index_col_major(self, row: int, col: int) -> int:
         return col * self.n_rows + row
 
     def _snapshot_grid(self, sim) -> np.ndarray:
-        out = np.empty((self.n_rows, self.n_cols, self._probe_dim), dtype=np.float32)
+        grid = np.empty((self.n_rows, self.n_cols, self._probe_dim), dtype=np.float32)
         for col in range(self.n_cols):
             for row in range(self.n_rows):
                 idx = self._probe_index_col_major(row, col)
-                out[row, col, 0] = float(sim.get_local_velocity(idx, 0))
-                out[row, col, 1] = float(sim.get_local_velocity(idx, 1))
-                out[row, col, 2] = float(sim.get_local_temperature(idx))
-        return out
+                grid[row, col, 0] = float(sim.get_local_velocity(idx, 0))
+                grid[row, col, 1] = float(sim.get_local_velocity(idx, 1))
+                grid[row, col, 2] = float(sim.get_local_temperature(idx))
+        return grid
 
-    def _update_moving_average(self, sim) -> np.ndarray:
-        snap = self._snapshot_grid(sim).reshape(-1).astype(np.float32)
+    def _update_probe_average(self, sim) -> np.ndarray:
+        snap = self._snapshot_grid(sim).astype(np.float32)
         self._probe_hist.append(snap)
-        # stack once to avoid list(...) overhead in loops
-        arr = np.stack(list(self._probe_hist), axis=0)
-        return np.mean(arr, axis=0).astype(np.float32)
+        return np.mean(np.stack(list(self._probe_hist), axis=0), axis=0).astype(np.float32)
 
-    def _global_to_local_obs(self, obs_flat: np.ndarray) -> np.ndarray:
-        grid = np.asarray(obs_flat, dtype=np.float32).reshape(self.n_rows, self.n_cols, 3)
-        locals_ = np.empty((self.n_seg, self.local_dim), dtype=np.float32)
-        for i in range(self.n_seg):
-            x0 = i * self.cols_per_seg
-            x1 = (i + 1) * self.cols_per_seg
+    def _joint_obs_from_grid(self, grid: np.ndarray) -> np.ndarray:
+        if grid.shape != (self.n_rows, self.n_cols, self._probe_dim):
+            raise ValueError(f"grid must be {(self.n_rows, self.n_cols, self._probe_dim)}, got {grid.shape}")
+
+        obs = np.empty((self.n_seg, self.local_dim), dtype=np.float32)
+        for seg_index in range(self.n_seg):
+            x0 = seg_index * self.cols_per_seg
+            x1 = (seg_index + 1) * self.cols_per_seg
             patch = grid[:, x0:x1, :]
-            locals_[i] = patch.reshape(-1)
-        return locals_
+            obs[seg_index] = patch.reshape(-1)
+        return obs
 
-    # ------------------ rewards ------------------
-    def _global_reward_from_genNu(self, gen_Nu: float) -> float:
-        # ONLY global heat flux
-        return float((self.nu_target - float(gen_Nu)) / float(self.reward_scale))
+    def _mixes_flux_vec(self, gen_flux: float, local_flux: np.ndarray) -> np.ndarray:
+        return ((1.0 - self.beta) * float(gen_flux) + self.beta * local_flux.astype(np.float32) * float(self.n_seg))
 
-    def _local_reward_vec(self, local_phi: np.ndarray) -> np.ndarray:
-        # diagnostic only (not used in training target)
-        r_local = (self.nu_target - local_phi.astype(np.float32) * float(self.n_seg)) / float(self.reward_scale)
-        return r_local.astype(np.float32)
+    def _rewards_from_history(self) -> np.ndarray:
+        fluxes_bar = np.mean(np.stack(list(self._fluxes_hist), axis=0), axis=0)
+        ke_bar = float(np.mean(self._ke_hist))
 
-    # ------------------ baseline / restart ------------------
+        x_fluxes = (self.flux_base - fluxes_bar) / (2.0 * self.flux_scale)
+        x_fluxes = np.clip(x_fluxes, -10.0, 10.0).astype(np.float32)
+        r_fluxes = np.tanh(x_fluxes).astype(np.float32)
+
+        x_ke = (self.ke_base - ke_bar) / (2.0 * self.ke_scale)
+        x_ke = float(np.clip(x_ke, -10.0, 10.0))
+        r_ke = float(np.tanh(x_ke))
+
+        rewards = self.w_flux * r_fluxes + self.w_ke * r_ke
+        return rewards.astype(np.float32)
+
     def _ensure_baseline_once(self) -> None:
         os.chdir(self.case_root)
-        step = _latest_restart_step(self.restart_dir)
-        if step > 0:
+        if _latest_restart_step(self.restart_dir) > 0:
             return
         sim = self.solver_factory(self.group_id, 1, 0)
         sim.set_segment_temperatures([self.baseline_T] * self.n_seg)
         sim.run_case(float(self.warmup_time))
-        self.nc_base = None  # release handle
 
-    # ------------------ logging helpers ------------------
-    # ---- folder A: per-episode step curve ----
     def _step_curve_dir(self) -> str:
         return os.path.join(self.log_root, "mean_reward_curve")
 
     def _step_curve_file(self, episode: int) -> str:
         return os.path.join(self._step_curve_dir(), f"episode_{int(episode):06d}.txt")
 
-    # ---- folder B: per-episode total mean return ----
     def _episode_curve_dir(self) -> str:
         return os.path.join(self.log_root, "mean_reward_by_episode")
 
@@ -216,8 +202,14 @@ class NCJointEnv(gym.Env):
         self._step_curve_inited = True
         return f
 
-    def append_step_reward(self, episode: int, actuation: int, sim_time: float,
-                           step_reward: float, rewards_vec: np.ndarray) -> None:
+    def append_step_mean_reward(
+            self,
+            episode: int,
+            actuation: int,
+            sim_time: float,
+            mean_reward: float,
+            rewards_vec: np.ndarray,
+    ) -> None:
         os.makedirs(self._step_curve_dir(), exist_ok=True)
         f = self._step_curve_file(int(episode))
         rv = np.asarray(rewards_vec, dtype=np.float32).reshape(-1)
@@ -226,23 +218,26 @@ class NCJointEnv(gym.Env):
 
         row = [str(int(actuation)),
                f"{float(sim_time):.6f}",
-               f"{float(step_reward):.6f}"] + [f"{float(x):.6f}" for x in rv.tolist()]
-
+               f"{float(mean_reward):.6f}"] + [f"{float(x):.6f}" for x in rv.tolist()]
         with open(f, "a", encoding="utf-8", buffering=1) as fp:
             fp.write(",".join(row) + "\n")
 
-    def append_episode_return(self, episode: int, episode_return: float) -> None:
+    def append_episode_mean_return(self, episode: int, mean_return: float) -> None:
         os.makedirs(self._episode_curve_dir(), exist_ok=True)
         f = self._episode_curve_file()
         with open(f, "a", encoding="utf-8", buffering=1) as fp:
-            fp.write(f"episode: {int(episode)}  mean_return: {float(episode_return):.6f}\n")
+            fp.write(f"episode: {int(episode)}  mean_return: {float(mean_return):.6f}\n")
 
-    # ------------------ gym API ------------------
     def reset(self, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
         super().reset(seed=seed)
         os.chdir(self.case_root)
 
         print(f"[env {self.group_id}] ===== Episode {self.episode} start =====")
+
+        self.step_count = 0
+        self.sim_time = float(self.warmup_time)
+        self._episode_return = 0.0
+        self._step_curve_inited = False
 
         self._ensure_baseline_once()
         self.restart_step = _latest_restart_step(self.restart_dir)
@@ -251,97 +246,99 @@ class NCJointEnv(gym.Env):
 
         self.nc = self.solver_factory(self.group_id, self.episode, int(self.restart_step))
         self.nc.run_case(float(self.warmup_time))
-        self.sim_time = float(self.warmup_time)
 
-        # reset episode-level state
-        self.step_count = 0
-        self._episode_return = 0.0
-        self._step_curve_inited = False
-
-        # moving average init
         self._probe_hist.clear()
-        snap0 = self._snapshot_grid(self.nc).reshape(-1).astype(np.float32)
+        snap0 = self._snapshot_grid(self.nc)
         for _ in range(self.avg_len):
             self._probe_hist.append(snap0.copy())
+        grid0 = np.mean(np.stack(list(self._probe_hist), axis=0), axis=0).astype(np.float32)
 
-        global_obs0 = self._update_moving_average(self.nc)
-        local_obs0 = self._global_to_local_obs(global_obs0)
+        gen_flux0 = float(self.nc.get_global_heat_flux())
+        local_flux0 = np.asarray([float(self.nc.get_local_phi_flux(i)) for i in range(self.n_seg)], dtype=np.float32)
+        gen_ke0 = float(self.nc.get_global_kinetic_energy())
+        mixes0 = self._mixes_flux_vec(gen_flux0, local_flux0)
 
-        # init per-episode file
+        self._fluxes_hist.clear()
+        self._ke_hist.clear()
+        for _ in range(self.avg_len):
+            self._fluxes_hist.append(mixes0.copy())
+            self._ke_hist.append(float(gen_ke0))
+
+        obs0 = self._joint_obs_from_grid(grid0)
         self.init_step_curve_file(self.episode)
-
-        info = {"episode": self.episode, "group_id": self.group_id, "sim_time": self.sim_time}
-        return local_obs0, info
+        info = {
+            "episode": int(self.episode),
+            "group_id": int(self.group_id),
+            "actuation": 0,
+            "sim_time": float(self.sim_time),
+        }
+        return obs0, info
 
     def step(self, action: np.ndarray):
         os.chdir(self.case_root)
 
-        a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.size != self.n_seg:
-            raise ValueError(f"Action must have length {self.n_seg}, got {a.shape}")
+        episode_now = int(self.episode)
+        actuation = int(self.step_count + 1)
 
-        temps = actions_to_segment_temps(
-            a,
-            baseline_T=self.baseline_T
-        )
-        self.nc.set_segment_temperatures(temps.tolist())
+        raw_actions = np.asarray(action, dtype=np.float32).reshape(-1)
+        if raw_actions.size != self.n_seg:
+            raise ValueError(f"Action must have length {self.n_seg}, got {raw_actions.shape}")
+
+        seg_temps = actions_to_segment_temps(raw_actions, baseline_T=self.baseline_T)
+        self.nc.set_segment_temperatures(seg_temps.tolist())
 
         end_time = float(self.sim_time + self.delta_time)
         self.nc.run_case(end_time)
         self.sim_time = end_time
-        self.step_count += 1
 
-        # obs
-        global_obs = self._update_moving_average(self.nc)
-        obs = self._global_to_local_obs(global_obs)
+        grid_time_avg = self._update_probe_average(self.nc)
+        obs = self._joint_obs_from_grid(grid_time_avg)
 
-        # compute flux
-        gen_Nu = float(self.nc.get_global_heat_flux())
-        local_phi_flux = np.asarray([float(self.nc.get_local_phi_flux(i)) for i in range(self.n_seg)], dtype=np.float32)
+        gen_flux = float(self.nc.get_global_heat_flux())
+        local_flux = np.asarray([float(self.nc.get_local_phi_flux(i)) for i in range(self.n_seg)], dtype=np.float32)
+        gen_ke = float(self.nc.get_global_kinetic_energy())
 
-        # training reward: global only
-        reward = self._global_reward_from_genNu(gen_Nu)
-        self._episode_return += float(reward)
-
-        # logging: per-seg diagnostic reward
-        rvec_local = self._local_reward_vec(local_phi_flux)
+        self._fluxes_hist.append(self._mixes_flux_vec(gen_flux, local_flux))
+        self._ke_hist.append(gen_ke)
+        rewards_all = self._rewards_from_history()
+        reward = float(np.mean(rewards_all))
+        self._episode_return += reward
 
         if not self._step_curve_inited:
-            self.init_step_curve_file(self.episode)
-
-        self.append_step_reward(
-            episode=self.episode,
-            actuation=int(self.step_count),
+            self.init_step_curve_file(episode_now)
+        self.append_step_mean_reward(
+            episode=episode_now,
+            actuation=actuation,
             sim_time=float(self.sim_time),
-            step_reward=float(reward),
-            rewards_vec=rvec_local,
+            mean_reward=reward,
+            rewards_vec=rewards_all,
         )
 
-        episode_limit = self.max_steps if not self.deterministic else self.max_steps_eval
-        terminated = (self.step_count >= episode_limit)
-        truncated = False
+        self.step_count += 1
+        terminated = False
+        truncated = (self.step_count >= self.max_steps)
 
-        if terminated:
-            # IMPORTANT: log under the episode that just finished
-            finished_ep = int(self.episode)
-            self.append_episode_return(finished_ep, self._episode_return)
+        info: Dict[str, object] = {
+            "episode": episode_now,
+            "group_id": int(self.group_id),
+            "actuation": actuation,
+            "sim_time": float(self.sim_time),
+            "raw_actions": raw_actions.astype(np.float32),
+            "temps": seg_temps.astype(np.float32),
+            "gen_flux": gen_flux,
+            "local_flux": local_flux,
+            "gen_ke": gen_ke,
+            "rewards_all": rewards_all,
+        }
 
+        if truncated:
+            self.append_episode_mean_return(episode_now, self._episode_return)
             self.episode += 1
             self.nc = None
             self._step_curve_inited = False
 
-        info: Dict[str, object] = {
-            "episode": self.episode,
-            "group_id": self.group_id,
-            "sim_time": self.sim_time,
-            "gen_Nu": gen_Nu,
-            "local_phi_flux": local_phi_flux,  # (n_seg,)
-            "temps": temps,  # (n_seg,)
-        }
-
-        return obs, float(reward), terminated, truncated, info
+        return obs, reward, terminated, truncated, info
 
     def close(self):
         self.nc = None
-        self.nc_base = None
         return
