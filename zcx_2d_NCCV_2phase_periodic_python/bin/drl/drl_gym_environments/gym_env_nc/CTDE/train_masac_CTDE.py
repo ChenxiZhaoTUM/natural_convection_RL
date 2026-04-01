@@ -14,8 +14,39 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from NCJointEnv import NCJointEnv
-from masac_CTDE import MASACCTDE, MASACConfig, JointReplayBuffer
+
+def find_package_root(
+        start_dir: str,
+        package_name: str = "zcx_2d_NCCV_2phase_periodic_python",
+        max_up: int = 10,
+) -> str:
+    """Walk upwards to locate the current project's package root."""
+    cur = os.path.abspath(start_dir)
+    for _ in range(max_up):
+        if os.path.basename(cur).lower() == package_name.lower():
+            return cur
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    raise RuntimeError(f"Cannot locate package root '{package_name}' from {start_dir}")
+
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+GYM_ROOT = os.path.dirname(os.path.dirname(THIS_DIR))
+PACKAGE_ROOT = find_package_root(THIS_DIR)
+DEFAULT_SPH_LIB_PATH = os.path.join(PACKAGE_ROOT, "lib", "Release")
+
+for p in (THIS_DIR, GYM_ROOT):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from gym_env_nc.CTDE.NCJointEnv import NCJointEnv
+    from gym_env_nc.CTDE.masac_CTDE import MASACCTDE, MASACConfig, JointReplayBuffer
+except ImportError:
+    from NCJointEnv import NCJointEnv
+    from masac_CTDE import MASACCTDE, MASACConfig, JointReplayBuffer
 
 
 # -----------------------------
@@ -63,7 +94,7 @@ def find_training_project(start_dir: str, max_up: int = 10) -> str:
         tp = os.path.join(cur, "training_process")
         if os.path.isdir(tp):
             return tp
-        if os.path.basename(cur).lower() == "zcx_2d_natural_convection_rl_periodic_python":
+        if os.path.basename(cur).lower() == "zcx_2d_nccv_2phase_periodic_python":
             return os.path.join(cur, "training_process")
         nxt = os.path.dirname(cur)
         if nxt == cur:
@@ -102,7 +133,7 @@ def make_env(
     if sph_lib_path and sph_lib_path not in sys.path:
         sys.path.insert(0, sph_lib_path)
 
-    import zcx_2d_natural_convection_RL_periodic_python as test_2d
+    import zcx_2d_NCCV_2phase_periodic_python as test_2d
     solver_factory = test_2d.natural_convection_from_sph_cpp
 
     return NCJointEnv(
@@ -201,8 +232,7 @@ def get_args():
     p.add_argument(
         "--sph-lib-path",
         type=str,
-        default=r"D:\SPHinXsys_build\tests\test_python_interface\zcx_2d_natural_convection_RL_periodic_python\lib"
-                r"\Release",
+        default=DEFAULT_SPH_LIB_PATH,
     )
 
     p.add_argument("--run-root", type=str, default=None)
