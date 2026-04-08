@@ -81,10 +81,10 @@ class NCPseudoEnv(gym.Env):
         self._fluxes_hist = deque(maxlen=self.avg_len)  # 4-step moving average for 10 fluxes
         self._ke_hist = deque(maxlen=self.avg_len)  # 4-step moving average for kinetic energy
         # baselines
-        self.flux_base = 0.19
-        self.ke_base = 0.04
+        self.flux_base = 190
+        self.ke_base = 60
         # scales
-        self.flux_scale = 0.018
+        self.flux_scale = 18
         self.ke_scale = 0.004  # 10% * 0.04 = 0.004
         # weights
         self.w_flux = 1.0

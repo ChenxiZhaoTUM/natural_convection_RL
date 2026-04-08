@@ -31,6 +31,86 @@ from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb, Critic
 from tianshou.utils import TensorboardLogger
 
+def find_package_root(
+        start_dir: str,
+        package_name: str = "zcx_2d_NCCV_2phase_periodic_python",
+        max_up: int = 10,
+) -> str:
+    """Walk upwards to locate the current project's package root."""
+    cur = os.path.abspath(start_dir)
+    for _ in range(max_up):
+        if os.path.basename(cur).lower() == package_name.lower():
+            return cur
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    raise RuntimeError(f"Cannot locate package root '{package_name}' from {start_dir}")
+
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+GYM_ROOT = os.path.dirname(os.path.dirname(THIS_DIR))
+PACKAGE_ROOT = find_package_root(THIS_DIR)
+DEFAULT_SPH_LIB_PATH = os.path.join(PACKAGE_ROOT, "lib", "Release")
+
+for p in (THIS_DIR, GYM_ROOT):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+
+# -----------------------------
+# Utilities: filesystem
+# -----------------------------
+def _rmtree_onerror(func, path, exc_info):
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except Exception:
+        pass
+    try:
+        func(path)
+    except Exception:
+        pass
+
+
+def rebuild_run_dir(run_dir: str, expected_basename: str) -> str:
+    """Clear & recreate run_dir safely (basename guard)."""
+    run_dir = os.path.abspath(run_dir)
+    base = os.path.basename(run_dir.rstrip("\\/"))
+    if base != expected_basename:
+        raise RuntimeError(
+            f"Refuse to clear unexpected directory:\n  {run_dir}\n"
+            f"Expected basename == '{expected_basename}'."
+        )
+
+    if os.path.isdir(run_dir):
+        for _ in range(5):
+            try:
+                shutil.rmtree(run_dir, onerror=_rmtree_onerror)
+                break
+            except Exception:
+                time.sleep(0.2)
+        if os.path.isdir(run_dir):
+            shutil.rmtree(run_dir, onerror=_rmtree_onerror)
+
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def find_training_project(start_dir: str, max_up: int = 10) -> str:
+    """Infer a default run_root by walking up to find training_process/."""
+    cur = os.path.abspath(start_dir)
+    for _ in range(max_up):
+        tp = os.path.join(cur, "training_process")
+        if os.path.isdir(tp):
+            return tp
+        if os.path.basename(cur).lower() == "zcx_2d_nccv_2phase_periodic_python":
+            return os.path.join(cur, "training_process")
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return os.path.join(os.path.abspath(start_dir), "training_process")
+
 
 # -------------------------------------------------
 # Env factory (MUST be top-level for Windows spawn)
@@ -169,7 +249,7 @@ def get_args():
     p.add_argument(
         "--sph-lib-path",
         type=str,
-        default=r"D:\SPHinXsys_build\tests\test_python_interface\zcx_2d_NCCV_2phase_periodic_python\lib\Release",
+        default=DEFAULT_SPH_LIB_PATH,
     )
 
     p.add_argument("--seed", type=int, default=0)
@@ -210,8 +290,8 @@ def main():
 
     # ---- fixed run_dir under training_process/ ----
     if args.run_root is None:
-        proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "training_process"))
-        args.run_root = proj_root
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        args.run_root = find_training_project(script_dir)
 
     run_dir = os.path.join(os.path.abspath(args.run_root), args.run_name)
 
